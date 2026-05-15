@@ -263,3 +263,36 @@ When referencing mise documentation URLs, use the correct path structure based o
 - **CLI reference**: `mise.en.dev/cli/...`
 
 Do NOT use shortened paths like `mise.en.dev/backends/...` - always include the full path matching the `docs/` directory structure.
+
+## Cursor Cloud specific instructions
+
+### Environment prerequisites
+
+The VM needs **Rust stable >= 1.91** (edition 2024) and **libssl-dev** for the `native-tls` feature. The update script handles `libssl-dev`; Rust stable is assumed to be pre-installed or upgraded once in the snapshot. If you see a Rust version error, run `rustup install stable && rustup default stable`.
+
+### Building and running
+
+- `cargo build --all-features` builds the debug binary to `target/debug/mise`.
+- Copy it to PATH (`sudo cp target/debug/mise /usr/local/bin/mise`) to bootstrap `mise` itself, which is needed for `mise run …` task commands.
+- Activate mise in your shell: `eval "$(mise activate bash)"`.
+- Install dev tools with `mise install` (reads `mise.toml`).
+
+### Lint / Test / Build commands
+
+All commands are documented in the "Development Commands" section above. Key quick-reference:
+
+| Action | Command |
+|---|---|
+| Build | `cargo build --all-features` |
+| Lint | `mise run lint` |
+| Lint + fix | `mise run lint-fix` |
+| Unit tests | `mise run test:unit` |
+| E2E tests | `mise run test:e2e [test_filename]...` |
+| All tests | `mise run test` |
+
+### Gotchas
+
+- The project's `mise.toml` adds `./target/debug` to PATH, so after `eval "$(mise activate bash)"` in `/workspace`, the freshly built `mise` binary is on PATH automatically. But the first build bootstraps from a system-installed `mise` (or the one you copied to `/usr/local/bin`).
+- E2E tests must be run via `mise run test:e2e`, never by executing the bash scripts directly.
+- Unit tests run with `RUST_TEST_THREADS=1` (set in `tasks.toml`).
+- The `[WARN] migrate: error parsing config file` warning on first run is harmless — it appears before the config is trusted.

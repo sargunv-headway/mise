@@ -256,6 +256,27 @@ graph can run lifecycle scripts:
 The following [tool-options](/dev-tools/#tool-options) are available for the `npm` backend. These
 go in `[tools]` in `mise.toml`.
 
+### `registry_url`
+
+Set the package registry used to resolve and install this tool. The override applies to the
+requested package and its transitive dependencies with the embedded aube installer and the
+supported external package managers.
+
+```toml
+[tools]
+"npm:prettier" = {
+  version = "latest",
+  registry_url = "https://libraries.cgr.dev/javascript/"
+}
+```
+
+Keep credentials out of `registry_url`. Use the user-level `~/.npmrc` when authentication must work
+for both version discovery and installation; `install_env` can provide install-scoped npm
+configuration for installation and checksum downloads. mise rejects registry URLs containing user
+information, query parameters, or fragments because the registry URL is recorded in `mise.lock`
+and the install manifest. Registries can publish different artifacts for the same package version,
+so changing `registry_url` causes mise to reinstall that version.
+
 ### `allow_builds`
 
 Packages whose dependency lifecycle build scripts should be approved when

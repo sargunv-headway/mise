@@ -15,13 +15,12 @@ assert_fail "pipx"
 
 # Use precompiled python
 export MISE_PYTHON_COMPILE=0
-export MISE_PIPX_REGISTRY_URL="https://pypi.org/simple/{}"
 
 # Set up a 2-step installation: pipx@1.5.0 > pipx:mkdocs@1.6.0
 cat >.mise.toml <<EOF
 [tools]
 pipx = "1.5.0"
-"pipx:mkdocs" = "1.6.0"
+"pipx:mkdocs" = { version = "1.6.0", registry_url = "https://pypi.org/simple/{}" }
 EOF
 
 mise install
@@ -30,10 +29,34 @@ mise install
 # (mkdocs conveniently returns its installation path in with --version)
 assert_contains "mise x -- mkdocs --version" "/mise/installs/pipx-mkdocs/1.6.0/"
 
-# Test invalid MISE_PIPX_REGISTRY_URL format (missing {} placeholder)
+# A selected registry must replace uv's public default rather than become an
+# additional index that falls back to PyPI.
+cat >"$HOME/bin/uv" <<'EOF'
+#!/usr/bin/env bash
+env | sort >"$TMPDIR/uv-registry-env"
+mkdir -p "$UV_TOOL_DIR/bin"
+EOF
+chmod +x "$HOME/bin/uv"
+export PATH="$HOME/bin:$PATH"
+export UV_INDEX="https://inherited-index.example/simple"
+export UV_EXTRA_INDEX_URL="https://inherited-extra.example/simple"
+cat >.mise.toml <<EOF
+[tools]
+"pipx:private-tool" = { version = "1.0.0", registry_url = "https://packages.example.com/simple/{}" }
+EOF
+mise install
+assert_contains "cat '$TMPDIR/uv-registry-env'" "UV_DEFAULT_INDEX=https://packages.example.com/simple"
+assert_not_contains "cat '$TMPDIR/uv-registry-env'" "UV_INDEX="
+assert_not_contains "cat '$TMPDIR/uv-registry-env'" "UV_EXTRA_INDEX_URL="
+
+# Test invalid per-tool registry_url format (missing {} placeholder)
 mise uninstall pipx:mkdocs
 mise cache clear
-export MISE_PIPX_REGISTRY_URL="https://invalid-registry.example/simple"
+cat >.mise.toml <<EOF
+[tools]
+pipx = "1.5.0"
+"pipx:mkdocs" = { version = "1.6.0", registry_url = "https://invalid-registry.example/simple" }
+EOF
 
 # This should fail with an error about the registry URL format
 assert_fail "mise install" "Registry URL must be a valid URL and contain a {} placeholder"

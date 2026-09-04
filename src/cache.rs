@@ -115,7 +115,7 @@ impl CacheManagerBuilder {
     }
 
     fn cache_key(&self) -> String {
-        hash_to_str(&self.cache_keys).chars().take(5).collect()
+        hash_to_str(&self.cache_keys)
     }
 
     pub(crate) fn build<T>(self) -> CacheManager<T>
@@ -539,6 +539,13 @@ mod tests {
         assert_eq!(val, &1);
         let val = cache.get_or_try_init(|| Ok(2)).unwrap();
         assert_eq!(val, &1);
+    }
+
+    #[test]
+    fn cache_key_keeps_full_hash_identity() {
+        let builder = CacheManagerBuilder::new("test-cache").with_cache_key("registry".into());
+        assert_eq!(builder.cache_key(), hash_to_str(&builder.cache_keys));
+        assert!(builder.cache_key().len() > 5);
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 //! `NPM_CONFIG_USERCONFIG`) and `NPM_CONFIG_*` env vars still apply.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock as Lazy;
+use std::sync::{Arc, LazyLock as Lazy};
 
 use aube_registry::NetworkMode;
 use aube_registry::client::RegistryClient;
@@ -23,6 +23,7 @@ use eyre::Result;
 use crate::backend::VersionInfo;
 use crate::backend::npm::is_semver_prerelease;
 use crate::config::Settings;
+use crate::hash::hash_to_str;
 
 /// Process-wide npm registry client. Registry URLs, scoped registries, and
 /// auth are read once from the environment and the user's `~/.npmrc`; the
@@ -33,11 +34,22 @@ use crate::config::Settings;
 /// cache, `prefer_offline()` serves the cache and only falls back to the
 /// network on a miss. (Offline state is set from the CLI/env at startup, so
 /// resolving it once at client construction is sufficient.)
-static CLIENT: Lazy<RegistryClient> = Lazy::new(|| {
+static CLIENT: Lazy<Arc<RegistryClient>> = Lazy::new(|| Arc::new(build_client(None, None, None)));
+
+fn build_client(
+    package_name: Option<&str>,
+    registry_url: Option<&str>,
+    project_dir: Option<&Path>,
+) -> RegistryClient {
     // Before the first registry request, so the memoized User-Agent is
     // mise's rather than standalone aube's.
     crate::backend::aube_host::init();
-    let config = NpmConfig::load(&meta_dir());
+    let cache_dir = meta_dir(registry_url);
+    let config = build_config(
+        package_name,
+        registry_url,
+        project_dir.unwrap_or(&cache_dir),
+    );
     let settings = Settings::get();
     let mode = if settings.offline() {
         NetworkMode::Offline
@@ -49,23 +61,65 @@ static CLIENT: Lazy<RegistryClient> = Lazy::new(|| {
     // Create the on-disk packument cache dir once here (client init runs at
     // most once per process) rather than on every async fetch — keeps the
     // blocking mkdir + its sync lock off the Tokio worker in the hot path.
-    let _ = crate::file::create_dir_all(meta_dir());
+    let _ = crate::file::create_dir_all(&cache_dir);
     RegistryClient::from_config(config).with_network_mode(mode)
-});
+}
+
+fn build_config(
+    package_name: Option<&str>,
+    registry_url: Option<&str>,
+    project_dir: &Path,
+) -> NpmConfig {
+    let mut config = NpmConfig::load(project_dir);
+    if let (Some(package_name), Some(registry_url)) = (package_name, registry_url) {
+        config.registry = registry_url.to_string();
+        if let Some(scope) = package_name
+            .strip_prefix('@')
+            .and_then(|name| name.split_once('/'))
+            .map(|(scope, _)| format!("@{scope}"))
+        {
+            config
+                .scoped_registries
+                .insert(scope.to_ascii_lowercase(), registry_url.to_string());
+        }
+    }
+    config
+}
+
+fn client(
+    package_name: &str,
+    registry_url: Option<&str>,
+    project_dir: Option<&Path>,
+) -> Arc<RegistryClient> {
+    match registry_url {
+        None if project_dir.is_none() => Arc::clone(&CLIENT),
+        // A custom registry is uncommon and scoped to one tool request.
+        // Building a client here avoids process-global registry state,
+        // which would race when tools install in parallel.
+        _ => Arc::new(build_client(Some(package_name), registry_url, project_dir)),
+    }
+}
 
 /// Neutral mise-owned directory used both as the client's "project dir" (so
 /// no real project `.npmrc` is read) and as `aube-registry`'s on-disk
 /// packument cache location.
-fn meta_dir() -> PathBuf {
-    crate::dirs::CACHE.join("npm-meta")
+fn meta_dir(registry_url: Option<&str>) -> PathBuf {
+    let base = crate::dirs::CACHE.join("npm-meta");
+    match registry_url {
+        Some(registry_url) => base.join(hash_to_str(&registry_url)),
+        None => base,
+    }
 }
 
 /// Fetch the full packument for `name`, honoring the configured registry and
 /// on-disk cache. The full (non-corgi) route is used so the `time` map is
 /// present for release-date / `minimum_release_age` filtering.
-async fn fetch_packument(name: &str) -> Result<aube_registry::Packument> {
-    Ok(CLIENT
-        .fetch_packument_with_time_cached(name, &meta_dir())
+async fn fetch_packument(
+    name: &str,
+    registry_url: Option<&str>,
+) -> Result<aube_registry::Packument> {
+    Ok(client(name, registry_url, None)
+        .fetch_packument_with_time_cached(name, &meta_dir(registry_url))
         .await?)
 }
 
@@ -82,8 +136,11 @@ fn all_versions_deprecated(packument: &aube_registry::Packument) -> bool {
 /// sorted to match the order `npm view versions` produced — prefix resolution
 /// (e.g. `npm:@angular/cli@19`) depends on it. Anything unparseable keeps a
 /// stable position at the end.
-pub(crate) async fn list_versions(name: &str) -> Result<Vec<VersionInfo>> {
-    let packument = fetch_packument(name).await?;
+pub(crate) async fn list_versions(
+    name: &str,
+    registry_url: Option<&str>,
+) -> Result<Vec<VersionInfo>> {
+    let packument = fetch_packument(name, registry_url).await?;
     let all_versions_deprecated = all_versions_deprecated(&packument);
     let versions = packument.versions.iter().filter_map(|(version, metadata)| {
         (all_versions_deprecated || metadata.deprecated.is_none()).then_some(version)
@@ -116,8 +173,11 @@ fn sort_versions<'a>(versions: impl Iterator<Item = &'a String>) -> Vec<&'a Stri
 }
 
 /// Resolve the `latest` dist-tag for a package, if the registry publishes one.
-pub(crate) async fn latest_dist_tag(name: &str) -> Result<Option<String>> {
-    let packument = fetch_packument(name).await?;
+pub(crate) async fn latest_dist_tag(
+    name: &str,
+    registry_url: Option<&str>,
+) -> Result<Option<String>> {
+    let packument = fetch_packument(name, registry_url).await?;
     let all_versions_deprecated = all_versions_deprecated(&packument);
     Ok(packument
         .dist_tags
@@ -134,19 +194,26 @@ pub(crate) async fn latest_dist_tag(name: &str) -> Result<Option<String>> {
 
 /// Download the exact npm registry tarball for a package version, honoring
 /// user npm registry and authentication configuration.
-pub(crate) async fn download_tarball(name: &str, version: &str, path: &Path) -> Result<()> {
-    let metadata = CLIENT.fetch_single_version_metadata(name, version).await?;
+pub(crate) async fn download_tarball(
+    name: &str,
+    version: &str,
+    path: &Path,
+    registry_url: Option<&str>,
+    project_dir: Option<&Path>,
+) -> Result<()> {
+    let client = client(name, registry_url, project_dir);
+    let metadata = client.fetch_single_version_metadata(name, version).await?;
     let dist = metadata
         .dist
         .ok_or_else(|| eyre::eyre!("npm package {name}@{version} has no dist metadata"))?;
-    let bytes = CLIENT.fetch_tarball_bytes(&dist.tarball).await?;
+    let bytes = client.fetch_tarball_bytes(&dist.tarball).await?;
     crate::file::write(path, bytes)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sort_versions;
+    use super::{build_config, meta_dir, sort_versions};
 
     #[test]
     fn sort_versions_supports_npm_safe_integer_components() {
@@ -176,5 +243,23 @@ mod tests {
                 "0.52.0",
             ]
         );
+    }
+
+    #[test]
+    fn custom_registry_overrides_scoped_registry_for_requested_package() {
+        let registry = "https://packages.example.com/javascript/";
+        let tmp = tempfile::tempdir().unwrap();
+        let config = build_config(Some("@acme/tool"), Some(registry), tmp.path());
+
+        assert_eq!(config.registry_for("@acme/tool"), registry);
+    }
+
+    #[test]
+    fn custom_registries_use_isolated_cache_directories() {
+        assert_ne!(
+            meta_dir(Some("https://packages.example.com/javascript/")),
+            meta_dir(Some("https://registry.npmjs.org/"))
+        );
+        assert_eq!(meta_dir(None), crate::dirs::CACHE.join("npm-meta"));
     }
 }

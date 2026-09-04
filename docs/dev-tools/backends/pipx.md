@@ -114,18 +114,30 @@ go in `[tools]` in `mise.toml`.
 
 Set the package registry URL mise uses to resolve versions for this tool. The URL must contain a
 `{}` placeholder for the package name. This overrides the `pipx.registry_url` setting for this
-tool only; registry arguments for installation are still configured separately through `uvx_args` or
-`pipx_args`.
+tool and mise derives the simple index URL used by `uv tool install` or `pipx install` from it.
 
 ```toml
 [tools]
 "pipx:my-tool" = {
   version = "latest",
-  registry_url = "https://packages.example.com/pypi/{}/json",
-  uvx_args = "--extra-index-url https://packages.example.com/pypi/simple",
-  pipx_args = "--pip-args='--extra-index-url https://packages.example.com/pypi/simple'"
+  registry_url = "https://packages.example.com/pypi/{}/json"
 }
 ```
+
+Simple-index registries can use the package placeholder directly:
+
+```toml
+[tools]
+"pipx:black" = {
+  version = "latest",
+  registry_url = "https://libraries.cgr.dev/python/simple/{}/"
+}
+```
+
+Keep credentials in `.netrc`, the package manager's user configuration, or `install_env` rather
+than putting them in `registry_url`. The registry URL is recorded in `mise.lock` because registries
+can publish different artifacts for the same package version. Use `uvx_args` or `pipx_args` only
+when you need additional indexes or other installer-specific behavior.
 
 ### `install_env`
 

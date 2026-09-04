@@ -303,6 +303,8 @@ impl Backend for PIPXBackend {
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
         let request_options = tv.request.options();
         let options = PipxOptions::new(&request_options);
+        let registry_url = self.get_registry_url(&ctx.config).await?;
+        let index_url = Self::get_index_url(&registry_url)?;
 
         // Check if pipx is available (unless uvx is being used)
         //
@@ -396,6 +398,7 @@ impl Backend for PIPXBackend {
                 &tv,
                 &ctx.ts,
                 ctx.pr.as_ref(),
+                &index_url,
             )
             .await?;
             cmd = cmd.args(Self::uv_exclude_newer_args(ctx.before_date));
@@ -420,6 +423,7 @@ impl Backend for PIPXBackend {
                         &tv,
                         &ctx.ts,
                         ctx.pr.as_ref(),
+                        &index_url,
                     )
                     .await?
                     .execute()
@@ -440,6 +444,7 @@ impl Backend for PIPXBackend {
                 &tv,
                 &ctx.ts,
                 ctx.pr.as_ref(),
+                &index_url,
             )
             .await?;
             cmd = cmd.args(Self::pip_uploaded_prior_to_args(ctx.before_date));
@@ -488,6 +493,7 @@ pub(crate) fn install_time_option_keys() -> Vec<String> {
         "pipx_args".into(),
         "uvx_args".into(),
         "uvx".into(),
+        "registry_url".into(),
     ]
 }
 
@@ -706,14 +712,15 @@ impl PIPXBackend {
         .build()
     }
 
-    fn get_index_url() -> eyre::Result<String> {
-        let registry_url = Settings::get().pipx.registry_url.clone();
-
+    fn get_index_url(registry_url: &str) -> eyre::Result<String> {
         // Remove {} placeholders and trailing slashes
         let mut url = registry_url
             .replace("{}", "")
             .trim_end_matches('/')
             .to_string();
+        if let Some((scheme, rest)) = url.split_once("://") {
+            url = format!("{scheme}://{}", rest.replace("//", "/"));
+        }
 
         // Handle different URL formats and convert to simple format
         if url.contains("pypi.org") {
@@ -795,6 +802,7 @@ impl PIPXBackend {
         tv: &ToolVersion,
         ts: &Toolset,
         pr: &'a dyn SingleReport,
+        index_url: &str,
     ) -> Result<CmdLineRunner<'a>> {
         let mut cmd = CmdLineRunner::new(uv_program);
         for arg in args {
@@ -805,7 +813,7 @@ impl PIPXBackend {
             .env_values(tv.install_env())
             .env("UV_TOOL_DIR", tv.install_path())
             .env("UV_TOOL_BIN_DIR", tv.install_path().join("bin"))
-            .env("UV_INDEX", Self::get_index_url()?)
+            .env("UV_INDEX", index_url)
             .prepend_path(ts.list_paths(config).await)?
             .prepend_path(vec![tv.install_path().join("bin")])?
             .prepend_path(b.dependency_toolset(config).await?.list_paths(config).await)
@@ -818,6 +826,7 @@ impl PIPXBackend {
         tv: &ToolVersion,
         ts: &Toolset,
         pr: &'a dyn SingleReport,
+        index_url: &str,
     ) -> Result<CmdLineRunner<'a>> {
         // Resolved rather than a bare "pipx": on Windows std only appends `.exe`, so a
         // pipx that exists only as `pipx.cmd` — how scoop and `pip install pipx` leave it —
@@ -832,7 +841,7 @@ impl PIPXBackend {
             .env_values(tv.install_env())
             // pipx 1.12+ auto-picks uv on PATH; this path passes pip-only --pip-args.
             .env("PIPX_DEFAULT_BACKEND", "pip")
-            .env("PIP_INDEX_URL", Self::get_index_url()?)
+            .env("PIP_INDEX_URL", index_url)
             .env_remove("PIPX_SHARED_LIBS")
             .env("PIPX_HOME", tv.install_path())
             .env("PIPX_BIN_DIR", tv.install_path().join("bin"))
@@ -1488,6 +1497,37 @@ cccccccccccccccccccccccccccccccccccccccc\trefs/heads/main\n";
                 .lockfile_options()
                 .get("extras"),
             Some(&"postgres,s3".to_string())
+        );
+    }
+
+    #[test]
+    fn registry_url_controls_install_index_and_lock_identity() {
+        let mut options = ToolVersionOptions::default();
+        options.opts.insert(
+            "registry_url".to_string(),
+            toml::Value::String("https://libraries.cgr.dev/python/simple/{}/".to_string()),
+        );
+        let options = PipxOptions::new(&options);
+
+        assert_eq!(
+            PIPXBackend::get_index_url(options.registry_url().unwrap()).unwrap(),
+            "https://libraries.cgr.dev/python/simple"
+        );
+        assert_eq!(
+            options.lockfile_options().get("registry_url"),
+            Some(&"https://libraries.cgr.dev/python/simple/{}/".to_string())
+        );
+    }
+
+    #[test]
+    fn json_registry_url_converts_to_simple_install_index() {
+        assert_eq!(
+            PIPXBackend::get_index_url("https://pypi.org/pypi/{}/json").unwrap(),
+            "https://pypi.org/simple"
+        );
+        assert_eq!(
+            PIPXBackend::get_index_url("https://packages.example.com/pypi/{}/json").unwrap(),
+            "https://packages.example.com/pypi/simple"
         );
     }
 

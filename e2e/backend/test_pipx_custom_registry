@@ -15,13 +15,12 @@ assert_fail "pipx"
 
 # Use precompiled python
 export MISE_PYTHON_COMPILE=0
-export MISE_PIPX_REGISTRY_URL="https://pypi.org/simple/{}"
 
 # Set up a 2-step installation: pipx@1.5.0 > pipx:mkdocs@1.6.0
 cat >.mise.toml <<EOF
 [tools]
 pipx = "1.5.0"
-"pipx:mkdocs" = "1.6.0"
+"pipx:mkdocs" = { version = "1.6.0", registry_url = "https://pypi.org/simple/{}" }
 EOF
 
 mise install

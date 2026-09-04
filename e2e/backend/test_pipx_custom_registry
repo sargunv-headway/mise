@@ -29,10 +29,14 @@ mise install
 # (mkdocs conveniently returns its installation path in with --version)
 assert_contains "mise x -- mkdocs --version" "/mise/installs/pipx-mkdocs/1.6.0/"
 
-# Test invalid MISE_PIPX_REGISTRY_URL format (missing {} placeholder)
+# Test invalid per-tool registry_url format (missing {} placeholder)
 mise uninstall pipx:mkdocs
 mise cache clear
-export MISE_PIPX_REGISTRY_URL="https://invalid-registry.example/simple"
+cat >.mise.toml <<EOF
+[tools]
+pipx = "1.5.0"
+"pipx:mkdocs" = { version = "1.6.0", registry_url = "https://invalid-registry.example/simple" }
+EOF
 
 # This should fail with an error about the registry URL format
 assert_fail "mise install" "Registry URL must be a valid URL and contain a {} placeholder"

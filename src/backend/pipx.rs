@@ -718,23 +718,21 @@ impl PIPXBackend {
             .replace("{}", "")
             .trim_end_matches('/')
             .to_string();
-        if let Some((scheme, rest)) = url.split_once("://") {
-            url = format!("{scheme}://{}", rest.replace("//", "/"));
-        }
 
         // Handle different URL formats and convert to simple format
         if url.contains("pypi.org") {
             // For pypi.org, convert any format to simple format
-            if url.contains("/pypi/") {
-                // Replace /pypi/*/json or /pypi/*/simple with /simple
-                let re = Regex::new(r"/pypi/[^/]*/(?:json|simple)$").unwrap();
-                url = re.replace(&url, "/simple").to_string();
+            if let Some((base, _)) = url.split_once("/pypi/") {
+                url = format!("{base}/simple");
             } else if !url.ends_with("/simple") {
                 // If it's pypi.org but doesn't already end with /simple, make it /simple
                 let base_url = url.split("/simple").next().unwrap_or(&url);
                 url = format!("{}/simple", base_url.trim_end_matches('/'));
             }
         } else {
+            if let Some((scheme, rest)) = url.split_once("://") {
+                url = format!("{scheme}://{}", rest.replace("//", "/"));
+            }
             // For custom registries, ensure they end with /simple
             if url.ends_with("/json") {
                 // Replace /json with /simple

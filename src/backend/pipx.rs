@@ -26,8 +26,7 @@ use eyre::{Result, bail, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use jiff::Timestamp;
-use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -40,6 +39,13 @@ use versions::Versioning;
 use xx::regex;
 
 const UV_EXCLUDE_NEWER_VERSION: &str = "0.2.22";
+const PIPX_REGISTRY_INSTALL_STATE_FILENAME: &str = ".mise-pipx-registry.toml";
+
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+struct PipxRegistryInstallState {
+    registry_url: Option<String>,
+}
 
 #[derive(Debug)]
 pub(crate) struct PIPXBackend {
@@ -107,6 +113,22 @@ impl Backend for PIPXBackend {
 
     fn ba(&self) -> &Arc<BackendArg> {
         &self.ba
+    }
+
+    async fn is_install_satisfied(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        check_symlink: bool,
+    ) -> Result<bool> {
+        if !self.is_version_installed(config, tv, check_symlink) {
+            return Ok(false);
+        }
+        let registry_url = match self.tool_name().parse()? {
+            PipxRequest::Pypi(_) => self.get_registry_override(config).await?,
+            PipxRequest::Git(_) => None,
+        };
+        Ok(self.registry_install_state_matches(tv, registry_url.as_deref()))
     }
 
     fn get_dependencies(&self) -> eyre::Result<Vec<&str>> {
@@ -305,6 +327,12 @@ impl Backend for PIPXBackend {
         let options = PipxOptions::new(&request_options);
         let registry_url = self.get_registry_url(&ctx.config).await?;
         let index_url = Self::get_index_url(&registry_url)?;
+        let request = self.tool_name().parse::<PipxRequest>()?;
+        let registry_override = match request {
+            PipxRequest::Pypi(_) => self.get_registry_override(&ctx.config).await?,
+            PipxRequest::Git(_) => None,
+        };
+        self.prepare_registry_install(&tv, registry_override.as_deref())?;
 
         // Check if pipx is available (unless uvx is being used)
         //
@@ -382,8 +410,6 @@ impl Backend for PIPXBackend {
                 );
             }
         }
-
-        let request = self.tool_name().parse::<PipxRequest>()?;
 
         if let Some(uv_program) = uv_program {
             let package_request = request.uvx_request(&tv.version, &options);
@@ -471,6 +497,7 @@ impl Backend for PIPXBackend {
         // This allows patch upgrades (3.12.1 → 3.12.2) to work without reinstalling
         let pkg_name = self.tool_name();
         fix_venv_python_symlink(&tv.install_path(), &pkg_name)?;
+        self.write_registry_install_state(&tv, registry_override.as_deref())?;
 
         Ok(tv)
     }
@@ -712,60 +739,110 @@ impl PIPXBackend {
         .build()
     }
 
-    fn get_index_url(registry_url: &str) -> eyre::Result<String> {
-        // Remove {} placeholders and trailing slashes
-        let mut url = registry_url
-            .replace("{}", "")
-            .trim_end_matches('/')
-            .to_string();
+    fn registry_install_state_matches(&self, tv: &ToolVersion, registry_url: Option<&str>) -> bool {
+        let expected = PipxRegistryInstallState {
+            registry_url: registry_url.map(str::to_string),
+        };
+        let state_path = tv.install_path().join(PIPX_REGISTRY_INSTALL_STATE_FILENAME);
+        if !state_path.exists() {
+            return expected.registry_url.is_none();
+        }
+        crate::file::read_to_string(&state_path)
+            .ok()
+            .and_then(|body| toml::from_str::<PipxRegistryInstallState>(&body).ok())
+            .is_some_and(|state| state == expected)
+    }
 
-        // Handle different URL formats and convert to simple format
-        if url.contains("pypi.org") {
-            // For pypi.org, convert any format to simple format
-            if let Some((base, _)) = url.split_once("/pypi/") {
-                url = format!("{base}/simple");
-            } else if !url.ends_with("/simple") {
-                // If it's pypi.org but doesn't already end with /simple, make it /simple
-                let base_url = url.split("/simple").next().unwrap_or(&url);
-                url = format!("{}/simple", base_url.trim_end_matches('/'));
-            }
-        } else {
-            if let Some((scheme, rest)) = url.split_once("://") {
-                url = format!("{scheme}://{}", rest.replace("//", "/"));
-            }
-            // For custom registries, ensure they end with /simple
-            if url.ends_with("/json") {
-                // Replace /json with /simple
-                url = url.replace("/json", "/simple");
-            } else if !url.ends_with("/simple") {
-                // If it doesn't end with /simple, append it
-                url = format!("{url}/simple");
-            }
+    fn write_registry_install_state(
+        &self,
+        tv: &ToolVersion,
+        registry_url: Option<&str>,
+    ) -> Result<()> {
+        let state = PipxRegistryInstallState {
+            registry_url: registry_url.map(str::to_string),
+        };
+        crate::file::write(
+            tv.install_path().join(PIPX_REGISTRY_INSTALL_STATE_FILENAME),
+            toml::to_string(&state)?,
+        )
+    }
+
+    fn prepare_registry_install(&self, tv: &ToolVersion, registry_url: Option<&str>) -> Result<()> {
+        let install_path = tv.install_path();
+        if install_path.exists() && !self.registry_install_state_matches(tv, registry_url) {
+            crate::file::remove_all(&install_path)?;
+            crate::file::create_dir_all(&install_path)?;
+        }
+        Ok(())
+    }
+
+    fn get_index_url(registry_url: &str) -> eyre::Result<String> {
+        const PACKAGE_SEGMENT: &str = "__mise_package__";
+        Self::validate_registry_url(registry_url)?;
+        let mut url = url::Url::parse(&registry_url.replace("{}", PACKAGE_SEGMENT))
+            .map_err(|err| eyre!("invalid pipx registry URL: {err}"))?;
+        let path = url.path().trim_matches('/');
+        let mut segments = path.split('/').collect::<Vec<_>>();
+        if segments.iter().any(|segment| segment.is_empty()) {
+            bail!("pipx registry URL must not contain empty path segments");
         }
 
-        debug!("Converted registry URL to index URL: {}", url);
-        Ok(url)
+        if segments.ends_with(&["simple", PACKAGE_SEGMENT]) {
+            segments.pop();
+        } else if segments.ends_with(&[PACKAGE_SEGMENT, "json"]) {
+            segments.truncate(segments.len() - 2);
+            if url.host_str() == Some("pypi.org") && segments.last() == Some(&"pypi") {
+                segments.pop();
+            }
+            segments.push("simple");
+        } else {
+            bail!(
+                "pipx registry URL must end with /simple/{{}} or /{{}}/json so mise can derive the install index"
+            );
+        }
+
+        url.set_path(&format!("/{}", segments.join("/")));
+        Ok(url.to_string().trim_end_matches('/').to_string())
     }
 
     async fn get_registry_url(&self, config: &Arc<Config>) -> eyre::Result<String> {
+        let registry_url = self
+            .get_registry_override(config)
+            .await?
+            .unwrap_or_else(|| Settings::get().pipx.registry_url.clone());
+        Self::validate_registry_url(&registry_url)?;
+        Ok(registry_url)
+    }
+
+    async fn get_registry_override(&self, config: &Arc<Config>) -> eyre::Result<Option<String>> {
         let raw_options = config.get_tool_opts_with_overrides(&self.ba).await?;
         let options = PipxOptions::new(&raw_options);
-        let registry_url = options
-            .registry_url()
-            .map(str::to_owned)
-            .unwrap_or_else(|| Settings::get().pipx.registry_url.clone());
-
-        debug!("Pipx registry URL: {}", registry_url);
-
-        let re = Regex::new(r"^(http|https)://.*\{\}.*$").unwrap();
-
-        if !re.is_match(&registry_url) {
-            return Err(eyre!(
-                "Registry URL must be a valid URL and contain a {{}} placeholder"
-            ));
+        let registry_url = options.registry_url().map(str::to_owned);
+        if let Some(registry_url) = &registry_url {
+            Self::validate_registry_url(registry_url)?;
         }
-
         Ok(registry_url)
+    }
+
+    fn validate_registry_url(registry_url: &str) -> eyre::Result<()> {
+        if registry_url.matches("{}").count() != 1 {
+            bail!("Registry URL must be a valid URL and contain a {{}} placeholder");
+        }
+        let parsed = url::Url::parse(&registry_url.replace("{}", "__mise_package__"))
+            .map_err(|err| eyre!("invalid pipx registry URL: {err}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!("Registry URL must be a valid URL and contain a {{}} placeholder");
+        }
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!(
+                "pipx registry URL must not contain credentials, query parameters, or fragments; configure shared authentication in .netrc"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) async fn reinstall_all(config: &Arc<Config>) -> Result<()> {
@@ -811,7 +888,10 @@ impl PIPXBackend {
             .env_values(tv.install_env())
             .env("UV_TOOL_DIR", tv.install_path())
             .env("UV_TOOL_BIN_DIR", tv.install_path().join("bin"))
-            .env("UV_INDEX", index_url)
+            .env_remove("UV_INDEX")
+            .env_remove("UV_INDEX_URL")
+            .env_remove("UV_EXTRA_INDEX_URL")
+            .env("UV_DEFAULT_INDEX", index_url)
             .prepend_path(ts.list_paths(config).await)?
             .prepend_path(vec![tv.install_path().join("bin")])?
             .prepend_path(b.dependency_toolset(config).await?.list_paths(config).await)
@@ -839,6 +919,7 @@ impl PIPXBackend {
             .env_values(tv.install_env())
             // pipx 1.12+ auto-picks uv on PATH; this path passes pip-only --pip-args.
             .env("PIPX_DEFAULT_BACKEND", "pip")
+            .env_remove("PIP_EXTRA_INDEX_URL")
             .env("PIP_INDEX_URL", index_url)
             .env_remove("PIPX_SHARED_LIBS")
             .env("PIPX_HOME", tv.install_path())
@@ -1159,10 +1240,28 @@ mod tests {
         PIPXBackend, PipxOptions, PipxRequest, PypiPackage, PypiRelease, UV_EXCLUDE_NEWER_VERSION,
     };
     use crate::github::GithubRelease;
-    use crate::toolset::ToolVersionOptions;
+    use crate::toolset::{ToolRequest, ToolSource, ToolVersion, ToolVersionOptions};
     use indexmap::IndexMap;
     use pretty_assertions::assert_eq;
     use std::ffi::OsString;
+    use std::path::Path;
+
+    fn test_tool_version(
+        backend: &PIPXBackend,
+        install_path: &Path,
+        options: ToolVersionOptions,
+    ) -> ToolVersion {
+        let request = ToolRequest::new_with_options(
+            backend.ba.clone(),
+            "1.0.0",
+            options,
+            ToolSource::Unknown,
+        )
+        .unwrap();
+        let mut tv = ToolVersion::new(request, "1.0.0".to_string());
+        tv.install_path = Some(install_path.to_path_buf());
+        tv
+    }
 
     #[test]
     fn parses_versions_from_simple_index_artifacts() {
@@ -1518,6 +1617,41 @@ cccccccccccccccccccccccccccccccccccccccc\trefs/heads/main\n";
     }
 
     #[test]
+    fn registry_install_state_tracks_registry_changes() {
+        let backend = PIPXBackend::from_arg("pipx:registry-state".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("install");
+        crate::file::create_dir_all(&install_path).unwrap();
+        crate::file::write(install_path.join("artifact"), "registry-a").unwrap();
+        let tv = test_tool_version(&backend, &install_path, ToolVersionOptions::default());
+
+        assert!(backend.registry_install_state_matches(&tv, None));
+        assert!(
+            !backend
+                .registry_install_state_matches(&tv, Some("https://registry-a.example/simple/{}/"))
+        );
+
+        backend
+            .write_registry_install_state(&tv, Some("https://registry-a.example/simple/{}/"))
+            .unwrap();
+        assert!(
+            backend
+                .registry_install_state_matches(&tv, Some("https://registry-a.example/simple/{}/"))
+        );
+        assert!(
+            !backend
+                .registry_install_state_matches(&tv, Some("https://registry-b.example/simple/{}/"))
+        );
+        assert!(!backend.registry_install_state_matches(&tv, None));
+
+        backend
+            .prepare_registry_install(&tv, Some("https://registry-b.example/simple/{}/"))
+            .unwrap();
+        assert!(!install_path.join("artifact").exists());
+        assert!(install_path.is_dir());
+    }
+
+    #[test]
     fn json_registry_url_converts_to_simple_install_index() {
         assert_eq!(
             PIPXBackend::get_index_url("https://pypi.org/pypi/{}/json").unwrap(),
@@ -1527,6 +1661,29 @@ cccccccccccccccccccccccccccccccccccccccc\trefs/heads/main\n";
             PIPXBackend::get_index_url("https://packages.example.com/pypi/{}/json").unwrap(),
             "https://packages.example.com/pypi/simple"
         );
+        assert_eq!(
+            PIPXBackend::get_index_url("https://notpypi.org/pypi/{}/json").unwrap(),
+            "https://notpypi.org/pypi/simple"
+        );
+    }
+
+    #[test]
+    fn registry_url_rejects_ambiguous_paths_and_persistable_credentials() {
+        assert_eq!(
+            PIPXBackend::get_index_url("https://packages.example.com/json-repo/{}/json").unwrap(),
+            "https://packages.example.com/json-repo/simple"
+        );
+        for registry_url in [
+            "https://packages.example.com/simple//{}",
+            "https://user:secret@packages.example.com/simple/{}",
+            "https://packages.example.com/simple/{}?token=secret",
+            "https://packages.example.com/simple/{}#secret",
+        ] {
+            let error = PIPXBackend::get_index_url(registry_url)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("secret"));
+        }
     }
 
     #[test]

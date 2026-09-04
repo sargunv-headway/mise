@@ -34,14 +34,22 @@ use crate::hash::hash_to_str;
 /// cache, `prefer_offline()` serves the cache and only falls back to the
 /// network on a miss. (Offline state is set from the CLI/env at startup, so
 /// resolving it once at client construction is sufficient.)
-static CLIENT: Lazy<Arc<RegistryClient>> = Lazy::new(|| Arc::new(build_client(None, None)));
+static CLIENT: Lazy<Arc<RegistryClient>> = Lazy::new(|| Arc::new(build_client(None, None, None)));
 
-fn build_client(package_name: Option<&str>, registry_url: Option<&str>) -> RegistryClient {
+fn build_client(
+    package_name: Option<&str>,
+    registry_url: Option<&str>,
+    project_dir: Option<&Path>,
+) -> RegistryClient {
     // Before the first registry request, so the memoized User-Agent is
     // mise's rather than standalone aube's.
     crate::backend::aube_host::init();
     let cache_dir = meta_dir(registry_url);
-    let config = build_config(package_name, registry_url, &cache_dir);
+    let config = build_config(
+        package_name,
+        registry_url,
+        project_dir.unwrap_or(&cache_dir),
+    );
     let settings = Settings::get();
     let mode = if settings.offline() {
         NetworkMode::Offline
@@ -78,13 +86,17 @@ fn build_config(
     config
 }
 
-fn client(package_name: &str, registry_url: Option<&str>) -> Arc<RegistryClient> {
+fn client(
+    package_name: &str,
+    registry_url: Option<&str>,
+    project_dir: Option<&Path>,
+) -> Arc<RegistryClient> {
     match registry_url {
-        None => Arc::clone(&CLIENT),
+        None if project_dir.is_none() => Arc::clone(&CLIENT),
         // A custom registry is uncommon and scoped to one tool request.
         // Building a client here avoids process-global registry state,
         // which would race when tools install in parallel.
-        Some(registry_url) => Arc::new(build_client(Some(package_name), Some(registry_url))),
+        _ => Arc::new(build_client(Some(package_name), registry_url, project_dir)),
     }
 }
 
@@ -106,7 +118,7 @@ async fn fetch_packument(
     name: &str,
     registry_url: Option<&str>,
 ) -> Result<aube_registry::Packument> {
-    Ok(client(name, registry_url)
+    Ok(client(name, registry_url, None)
         .fetch_packument_with_time_cached(name, &meta_dir(registry_url))
         .await?)
 }
@@ -187,8 +199,9 @@ pub(crate) async fn download_tarball(
     version: &str,
     path: &Path,
     registry_url: Option<&str>,
+    project_dir: Option<&Path>,
 ) -> Result<()> {
-    let client = client(name, registry_url);
+    let client = client(name, registry_url, project_dir);
     let metadata = client.fetch_single_version_metadata(name, version).await?;
     let dist = metadata
         .dist

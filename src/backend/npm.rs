@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use aube::embed::{EmbedderInstallOverrides, EmbedderRuntime};
 use bytesize::ByteSize;
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
@@ -42,6 +43,33 @@ const BUN_MIN_RELEASE_AGE_VERSION: &str = "1.3.0";
 const NPM_IGNORE_SCRIPTS_ARG: &str = "--ignore-scripts=true";
 const PNPM_MIN_RELEASE_AGE_VERSION: &str = "10.16.0";
 const PNPM_GLOBAL_DIR_ENV_VERSION: &str = "12.0.0";
+const NPM_REGISTRY_INSTALL_STATE_FILENAME: &str = ".mise-npm-registry.toml";
+
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+struct NpmRegistryInstallState {
+    registry_url: Option<String>,
+}
+
+struct TemporaryNpmConfig {
+    file: tempfile::NamedTempFile,
+    project_npmrc: PathBuf,
+    original_project_npmrc: Option<Vec<u8>>,
+}
+
+impl Drop for TemporaryNpmConfig {
+    fn drop(&mut self) {
+        let _ = self.file.as_file().sync_all();
+        match &self.original_project_npmrc {
+            Some(contents) => {
+                let _ = std::fs::write(&self.project_npmrc, contents);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.project_npmrc);
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct NPMBackend {
@@ -298,6 +326,19 @@ impl Backend for NPMBackend {
         &self.ba
     }
 
+    async fn is_install_satisfied(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        check_symlink: bool,
+    ) -> Result<bool> {
+        if !self.is_version_installed(config, tv, check_symlink) {
+            return Ok(false);
+        }
+        let registry_url = self.get_registry_url(config).await?;
+        Ok(self.registry_install_state_matches(tv, registry_url.as_deref()))
+    }
+
     fn is_install_path_healthy(&self, install_path: &Path) -> bool {
         aube_install_tree_is_healthy(install_path)
     }
@@ -448,8 +489,19 @@ impl Backend for NPMBackend {
         let request_options = tv.request.options();
         let options = NpmOptions::new(&request_options);
         let registry_url = self.get_registry_url(&ctx.config).await?;
+        self.prepare_registry_install(&tv, registry_url.as_deref())?;
         self.write_registry_npmrc(&tv.install_path(), registry_url.as_deref())?;
-        let package = self.package_install_spec(ctx, &tv, &options).await?;
+        let mut temporary_npm_config = (package_manager == NpmPackageManager::Aube
+            || options.checksum().is_some())
+        .then(|| self.temporary_install_env_npm_config(&tv, registry_url.as_deref()))
+        .transpose()?
+        .flatten();
+        let package = self
+            .package_install_spec(ctx, &tv, &options, registry_url.as_deref())
+            .await?;
+        if package_manager != NpmPackageManager::Aube {
+            drop(temporary_npm_config.take());
+        }
         let install_before_args = match ctx.before_date {
             Some(before_date) => {
                 self.warn_if_package_manager_may_not_support_release_age(ctx, package_manager)
@@ -603,6 +655,8 @@ impl Backend for NPMBackend {
                 }
             }
         }
+        drop(temporary_npm_config);
+        self.write_registry_install_state(&tv, registry_url.as_deref())?;
         Ok(tv)
     }
 
@@ -637,6 +691,7 @@ impl NPMBackend {
         ctx: &InstallContext,
         tv: &ToolVersion,
         options: &NpmOptions<'_>,
+        registry_url: Option<&str>,
     ) -> Result<String> {
         let Some(checksum) = options.checksum() else {
             return Ok(format!("{}@{}", self.tool_name(), tv.version));
@@ -653,7 +708,8 @@ impl NPMBackend {
             &self.tool_name(),
             &tv.version,
             &archive,
-            options.registry_url(),
+            registry_url,
+            Some(&tv.install_path()),
         )
         .await?;
         ctx.pr
@@ -677,13 +733,27 @@ impl NPMBackend {
             .filter(|url| !url.is_empty())
             .map(str::to_string);
         if let Some(registry_url) = &registry_url {
-            let parsed = url::Url::parse(registry_url)
-                .map_err(|err| eyre::eyre!("invalid npm registry URL {registry_url:?}: {err}"))?;
-            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                eyre::bail!("npm registry URL must be an http or https URL");
-            }
+            Self::validate_registry_url(registry_url)?;
         }
         Ok(registry_url)
+    }
+
+    fn validate_registry_url(registry_url: &str) -> Result<()> {
+        let parsed = url::Url::parse(registry_url)
+            .map_err(|err| eyre::eyre!("invalid npm registry URL: {err}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            eyre::bail!("npm registry URL must be an http or https URL");
+        }
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            eyre::bail!(
+                "npm registry URL must not contain credentials, query parameters, or fragments; configure authentication in .npmrc or install_env"
+            );
+        }
+        Ok(())
     }
 
     fn latest_version_cache(&self, registry_url: Option<&str>) -> CacheManager<Option<String>> {
@@ -701,11 +771,128 @@ impl NPMBackend {
             .build()
     }
 
+    fn registry_install_state_matches(&self, tv: &ToolVersion, registry_url: Option<&str>) -> bool {
+        let expected = NpmRegistryInstallState {
+            registry_url: registry_url.map(str::to_string),
+        };
+        let state_path = tv.install_path().join(NPM_REGISTRY_INSTALL_STATE_FILENAME);
+        if state_path.exists() {
+            return crate::file::read_to_string(&state_path)
+                .ok()
+                .and_then(|body| toml::from_str::<NpmRegistryInstallState>(&body).ok())
+                .is_some_and(|state| state == expected);
+        }
+
+        let legacy_registry = crate::file::read_to_string(tv.install_path().join(".npmrc"))
+            .ok()
+            .and_then(|body| {
+                body.lines()
+                    .find_map(|line| line.strip_prefix("registry="))
+                    .map(str::to_string)
+            });
+        legacy_registry == expected.registry_url
+    }
+
+    fn prepare_registry_install(&self, tv: &ToolVersion, registry_url: Option<&str>) -> Result<()> {
+        let install_path = tv.install_path();
+        if install_path.exists() && !self.registry_install_state_matches(tv, registry_url) {
+            crate::file::remove_all(&install_path)?;
+            crate::file::create_dir_all(&install_path)?;
+        }
+        Ok(())
+    }
+
+    fn write_registry_install_state(
+        &self,
+        tv: &ToolVersion,
+        registry_url: Option<&str>,
+    ) -> Result<()> {
+        let state = NpmRegistryInstallState {
+            registry_url: registry_url.map(str::to_string),
+        };
+        crate::file::write(
+            tv.install_path().join(NPM_REGISTRY_INSTALL_STATE_FILENAME),
+            toml::to_string(&state)?,
+        )
+    }
+
+    fn temporary_install_env_npm_config(
+        &self,
+        tv: &ToolVersion,
+        registry_url: Option<&str>,
+    ) -> Result<Option<TemporaryNpmConfig>> {
+        let install_env = tv.install_env();
+        let userconfig = ["NPM_CONFIG_USERCONFIG", "npm_config_userconfig"]
+            .into_iter()
+            .find_map(|key| install_env.get(key).cloned()?.into_string());
+        let mut contents = match userconfig.as_deref() {
+            Some(path) => crate::file::read_to_string(path)?,
+            None => String::new(),
+        };
+        for (name, value) in install_env {
+            let Some(value) = value.into_string() else {
+                continue;
+            };
+            let suffix = name
+                .strip_prefix("NPM_CONFIG_")
+                .or_else(|| name.strip_prefix("npm_config_"));
+            let Some(suffix) = suffix else {
+                continue;
+            };
+            if suffix.eq_ignore_ascii_case("userconfig") {
+                continue;
+            }
+            let key = if suffix.starts_with("//") {
+                suffix.to_string()
+            } else if let Some(rest) = suffix.strip_prefix('@')
+                && let Some((scope, tail)) = rest.split_once(':')
+                && tail.eq_ignore_ascii_case("registry")
+            {
+                format!("@{}:registry", scope.to_ascii_lowercase())
+            } else {
+                suffix.to_ascii_lowercase().replace('_', "-")
+            };
+            if registry_url.is_some() && (key == "registry" || key.ends_with(":registry")) {
+                continue;
+            }
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(&format!("{key}={value}\n"));
+        }
+        if contents.is_empty() {
+            return Ok(None);
+        }
+
+        let mut file = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(&mut file, contents.as_bytes())?;
+        let project_npmrc = tv.install_path().join(".npmrc");
+        let original_project_npmrc = std::fs::read(&project_npmrc).ok();
+        let mut project_contents = original_project_npmrc
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default()
+            .into_owned();
+        if !project_contents.is_empty() && !project_contents.ends_with('\n') {
+            project_contents.push('\n');
+        }
+        project_contents.push_str(&format!("npmrc-auth-file={}\n", file.path().display()));
+        crate::file::write(&project_npmrc, project_contents)?;
+        Ok(Some(TemporaryNpmConfig {
+            file,
+            project_npmrc,
+            original_project_npmrc,
+        }))
+    }
+
     fn registry_env(&self, registry_url: Option<&str>) -> Vec<(String, String)> {
         let Some(registry_url) = registry_url else {
             return Vec::new();
         };
-        let mut env = vec![("NPM_CONFIG_REGISTRY".to_string(), registry_url.to_string())];
+        let mut env = vec![
+            ("NPM_CONFIG_REGISTRY".to_string(), registry_url.to_string()),
+            ("npm_config_registry".to_string(), registry_url.to_string()),
+        ];
         if let Some(scope) = self
             .tool_name()
             .strip_prefix('@')
@@ -714,6 +901,10 @@ impl NPMBackend {
         {
             env.push((
                 format!("NPM_CONFIG_@{scope}:registry"),
+                registry_url.to_string(),
+            ));
+            env.push((
+                format!("npm_config_@{scope}:registry"),
                 registry_url.to_string(),
             ));
         }
@@ -1309,7 +1500,6 @@ impl NPMBackend {
         // Validate the fallible options before writing anything, so a malformed
         // value fails without leaving a half-written project dir behind.
         let aube_config = self.aube_project_config(before_date, options, resolved_from_lockfile)?;
-        self.write_registry_npmrc(install_path, options.registry_url())?;
 
         let mut manifest = serde_json::json!({
             "name": "mise-npm-install",
@@ -1919,7 +2109,6 @@ mod tests {
             self.0.lock().unwrap().push(message);
         }
     }
-    #[cfg(unix)]
     use crate::toolset::ToolVersion;
     use crate::toolset::{ToolRequest, ToolSource, ToolVersionOptions};
     use pretty_assertions::assert_eq;
@@ -1933,6 +2122,23 @@ mod tests {
             BackendResolution::new(true),
         );
         NPMBackend::from_arg(ba)
+    }
+
+    fn test_tool_version(
+        backend: &NPMBackend,
+        install_path: &Path,
+        options: ToolVersionOptions,
+    ) -> ToolVersion {
+        let request = ToolRequest::new_with_options(
+            backend.ba().clone(),
+            "1.0.0",
+            options,
+            ToolSource::Unknown,
+        )
+        .unwrap();
+        let mut tv = ToolVersion::new(request, "1.0.0".to_string());
+        tv.install_path = Some(install_path.to_path_buf());
+        tv
     }
 
     #[tokio::test]
@@ -2714,6 +2920,105 @@ pkg@1.2.0 '1.2.0'
     }
 
     #[test]
+    fn registry_install_state_tracks_registry_changes() {
+        let backend = create_npm_backend("registry-state");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("install");
+        crate::file::create_dir_all(&install_path).unwrap();
+        crate::file::write(install_path.join("artifact"), "registry-a").unwrap();
+        let tv = test_tool_version(&backend, &install_path, ToolVersionOptions::default());
+
+        assert!(backend.registry_install_state_matches(&tv, None));
+        assert!(!backend.registry_install_state_matches(&tv, Some("https://registry-a.example/")));
+
+        backend
+            .write_registry_install_state(&tv, Some("https://registry-a.example/"))
+            .unwrap();
+        assert!(backend.registry_install_state_matches(&tv, Some("https://registry-a.example/")));
+        assert!(!backend.registry_install_state_matches(&tv, Some("https://registry-b.example/")));
+        assert!(!backend.registry_install_state_matches(&tv, None));
+
+        backend
+            .prepare_registry_install(&tv, Some("https://registry-b.example/"))
+            .unwrap();
+        assert!(!install_path.join("artifact").exists());
+        assert!(install_path.is_dir());
+    }
+
+    #[test]
+    fn registry_url_rejects_persistable_credentials() {
+        assert!(NPMBackend::validate_registry_url("https://registry.example/npm/").is_ok());
+        for registry_url in [
+            "https://user:secret@registry.example/npm/",
+            "https://registry.example/npm/?token=secret",
+            "https://registry.example/npm/#secret",
+        ] {
+            let error = NPMBackend::validate_registry_url(registry_url)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn registry_env_sets_both_npm_casings() {
+        let backend = create_npm_backend("@acme/tool");
+        let registry = "https://registry.example/";
+
+        assert_eq!(
+            backend.registry_env(Some(registry)),
+            vec![
+                ("NPM_CONFIG_REGISTRY".to_string(), registry.to_string()),
+                ("npm_config_registry".to_string(), registry.to_string()),
+                (
+                    "NPM_CONFIG_@acme:registry".to_string(),
+                    registry.to_string()
+                ),
+                (
+                    "npm_config_@acme:registry".to_string(),
+                    registry.to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn temporary_npm_config_exposes_install_env_auth_without_persisting_it() {
+        let backend = create_npm_backend("private-tool");
+        let tmp = tempfile::tempdir().unwrap();
+        let install_path = tmp.path().join("install");
+        crate::file::create_dir_all(&install_path).unwrap();
+        let mut options = ToolVersionOptions::default();
+        options.install_env.insert(
+            "NPM_CONFIG_//registry.example/:_authToken".to_string(),
+            crate::config::env_directive::EnvValue::from("test-token"),
+        );
+        let tv = test_tool_version(&backend, &install_path, options);
+        backend
+            .write_registry_npmrc(&install_path, Some("https://registry.example/"))
+            .unwrap();
+
+        let guard = backend
+            .temporary_install_env_npm_config(&tv, Some("https://registry.example/"))
+            .unwrap()
+            .unwrap();
+        let temporary_path = guard.file.path().to_path_buf();
+        let config = aube_registry::config::NpmConfig::load(&install_path);
+        assert_eq!(
+            config.auth_token_for("https://registry.example/"),
+            Some("test-token")
+        );
+        assert!(temporary_path.exists());
+
+        drop(guard);
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            crate::file::read_to_string(install_path.join(".npmrc")).unwrap(),
+            "registry=https://registry.example/\n"
+        );
+    }
+
+    #[test]
     fn test_resolve_lockfile_options_includes_install_args_only() {
         let backend = create_npm_backend("react-devtools");
         let mut options = ToolVersionOptions::default();
@@ -2874,7 +3179,7 @@ pkg@1.2.0 '1.2.0'
     }
 
     #[test]
-    fn test_write_aube_embed_project_applies_scoped_registry() {
+    fn test_write_aube_embed_project_preserves_scoped_registry() {
         let backend = create_npm_backend("@acme/tool");
         let tmp = tempfile::tempdir().unwrap();
         let install_path = tmp.path().join("npm-acme-tool").join("1.0.0");
@@ -2886,6 +3191,9 @@ pkg@1.2.0 '1.2.0'
         );
         let options = NpmOptions::new(&raw_options);
         let allow_builds = options.allow_builds().unwrap();
+        backend
+            .write_registry_npmrc(&install_path, options.registry_url())
+            .unwrap();
 
         backend
             .write_aube_embed_project(&install_path, None, &options, &allow_builds, false)

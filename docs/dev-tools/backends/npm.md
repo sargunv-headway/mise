@@ -270,9 +270,12 @@ supported external package managers.
 }
 ```
 
-Keep credentials in the user-level `~/.npmrc` or another package-manager authentication mechanism
-instead of putting them in `registry_url`. The registry URL is recorded in `mise.lock` because
-registries can publish different artifacts for the same package version.
+Keep credentials out of `registry_url`. Use the user-level `~/.npmrc` when authentication must work
+for both version discovery and installation; `install_env` can provide install-scoped npm
+configuration for installation and checksum downloads. mise rejects registry URLs containing user
+information, query parameters, or fragments because the registry URL is recorded in `mise.lock`
+and the install manifest. Registries can publish different artifacts for the same package version,
+so changing `registry_url` causes mise to reinstall that version.
 
 ### `allow_builds`
 
